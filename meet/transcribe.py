@@ -18,7 +18,7 @@ import logging
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -464,6 +464,12 @@ class TranscriptionConfig:
     #   "dual" = transcribe each channel separately, label as YOU/REMOTE
     mixdown: str = "mono"
 
+    # Internal: set to True by __post_init__ when `device` was auto-flipped
+    # to 'cpu' because the requested accelerator was unavailable.  Used to
+    # produce an honest annotation in the model-load log line — distinguishes
+    # "user explicitly passed --device cpu" from "we fell back".
+    _device_auto_fallback: bool = field(default=False, init=False, repr=False)
+
     def __post_init__(self):
         if self.mixdown not in ("mono", "dual"):
             raise ValueError(
@@ -494,23 +500,36 @@ class TranscriptionConfig:
         # Validate device availability when torch is installed.  We deliberately
         # skip validation when torch can't be imported so that
         # `TranscriptionConfig` remains constructible in torch-less test
-        # environments and lightweight CLI helpers (e.g. `meet check`).
+        # environments and lightweight CLI helpers.
+        #
+        # When the requested device is not available we automatically fall back
+        # to CPU instead of raising — this handles the common case where CUDA
+        # was requested but no GPU is present (e.g. running on a laptop or
+        # inside a container without GPU passthrough).
         for field_name, value in (
             ("device", self.device),
             ("torch_device", self.torch_device),
         ):
             available = _torch_device_available(value)
             if available is None:
-                # torch is not installed (or device string is unknown to our
-                # helper) — skip.
                 continue
             if not available:
-                raise ValueError(
-                    f"{field_name}='{value}' but {value.upper()} is not "
-                    f"available on this system. "
-                    "Try --device cpu (and --torch-device cpu/mps) or install "
-                    "the appropriate torch build."
+                fallback = "cpu"
+                log.warning(
+                    "%s='%s' is not available, falling back to '%s'",
+                    field_name, value, fallback,
                 )
+                if field_name == "device":
+                    self.device = fallback
+                    self._device_auto_fallback = True
+                    if self.compute_type == "float16":
+                        log.warning(
+                            "compute_type='float16' is unsupported on CPU, "
+                            "downgrading to 'int8'"
+                        )
+                        self.compute_type = "int8"
+                elif field_name == "torch_device":
+                    self.torch_device = fallback
 
         if self.hf_token is None:
             self.hf_token = os.environ.get("HF_TOKEN")
@@ -822,8 +841,14 @@ def _load_whisperx_asr_model(config: TranscriptionConfig, language: str | None):
         "vad_onset": config.vad_onset,
         "vad_offset": config.vad_offset,
     }
+    device_note = ""
+    if config.device == "cpu":
+        if config._device_auto_fallback:
+            device_note = " (fallback — no GPU)"
+        else:
+            device_note = " (forced)"
     print(
-        f"  Loading model: {config.model} ({config.compute_type}) on {config.device}"
+        f"  Loading model: {config.model} ({config.compute_type}) on {config.device}{device_note}"
     )
     return whisperx.load_model(
         config.model,
