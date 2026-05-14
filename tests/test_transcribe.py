@@ -422,19 +422,74 @@ class TestTranscriptionConfig:
         assert config.torch_device == "mps"
 
     def test_invalid_torch_device_cuda_raises(self, monkeypatch):
-        # Force the helper to report cuda unavailable.
+        # PR #19 changed this from raising to auto-falling-back.  Renamed test
+        # kept here as a thin alias so failure trail still searches the old
+        # name; full coverage lives in test_cuda_unavailable_falls_back_*.
         def fake_avail(d):
             return False if d == "cuda" else True
         monkeypatch.setattr("meet.transcribe._torch_device_available", fake_avail)
-        with pytest.raises(ValueError, match="CUDA is not available"):
-            TranscriptionConfig(device="cuda", torch_device="cuda")
+        config = TranscriptionConfig(device="cuda", torch_device="cuda")
+        # Both 'device' and 'torch_device' fall back to cpu when cuda is
+        # unavailable; compute_type downgrades because device flipped.
+        assert config.device == "cpu"
+        assert config.torch_device == "cpu"
+        assert config.compute_type == "int8"
+        assert config._device_auto_fallback is True
 
     def test_invalid_torch_device_mps_raises(self, monkeypatch):
+        # PR #19: mps unavailability falls back to cpu instead of raising.
+        # Only torch_device is affected; device/compute_type are untouched
+        # (compute_type only flips when *device* falls back).
         def fake_avail(d):
             return False if d == "mps" else True
         monkeypatch.setattr("meet.transcribe._torch_device_available", fake_avail)
-        with pytest.raises(ValueError, match="MPS is not available"):
-            TranscriptionConfig(device="cpu", torch_device="mps")
+        config = TranscriptionConfig(
+            device="cpu", torch_device="mps", compute_type="float16"
+        )
+        assert config.device == "cpu"
+        assert config.torch_device == "cpu"
+        # device was already cpu (not auto-flipped), so compute_type stays.
+        assert config.compute_type == "float16"
+        assert config._device_auto_fallback is False
+
+    def test_cuda_unavailable_logs_both_warnings(self, monkeypatch, caplog):
+        def fake_avail(d):
+            return False if d == "cuda" else True
+        monkeypatch.setattr("meet.transcribe._torch_device_available", fake_avail)
+        with caplog.at_level(logging.WARNING, logger="meet.transcribe"):
+            TranscriptionConfig(device="cuda", torch_device="cuda",
+                                compute_type="float16")
+        messages = [r.getMessage() for r in caplog.records]
+        # Device fallback warning (formatted via %-args)
+        assert any("device='cuda'" in m and "falling back to 'cpu'" in m
+                   for m in messages), messages
+        # compute_type downgrade warning
+        assert any("compute_type='float16'" in m and "int8" in m
+                   for m in messages), messages
+
+    def test_cuda_unavailable_with_int8_does_not_log_compute_type_change(
+        self, monkeypatch, caplog
+    ):
+        def fake_avail(d):
+            return False if d == "cuda" else True
+        monkeypatch.setattr("meet.transcribe._torch_device_available", fake_avail)
+        with caplog.at_level(logging.WARNING, logger="meet.transcribe"):
+            config = TranscriptionConfig(device="cuda", torch_device="cuda",
+                                         compute_type="int8")
+        assert config.compute_type == "int8"
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("compute_type" in m for m in messages), messages
+
+    def test_explicit_cpu_is_not_marked_as_auto_fallback(self, monkeypatch):
+        # User passing --device cpu on a no-GPU machine must NOT be flagged
+        # as a fallback (guards _load_whisperx_asr_model's "(forced)" vs
+        # "(fallback — no GPU)" annotation).
+        monkeypatch.setattr(
+            "meet.transcribe._torch_device_available", lambda d: True
+        )
+        config = TranscriptionConfig(device="cpu", torch_device="cpu",
+                                     compute_type="int8")
+        assert config._device_auto_fallback is False
 
     def test_validation_skipped_when_torch_missing(self, monkeypatch):
         # When torch is not installed, the helper returns None; validation

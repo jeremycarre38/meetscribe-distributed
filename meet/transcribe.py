@@ -18,7 +18,7 @@ import logging
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -464,6 +464,12 @@ class TranscriptionConfig:
     #   "dual" = transcribe each channel separately, label as YOU/REMOTE
     mixdown: str = "mono"
 
+    # Internal: set to True by __post_init__ when `device` was auto-flipped
+    # to 'cpu' because the requested accelerator was unavailable.  Used to
+    # produce an honest annotation in the model-load log line — distinguishes
+    # "user explicitly passed --device cpu" from "we fell back".
+    _device_auto_fallback: bool = field(default=False, init=False, repr=False)
+
     def __post_init__(self):
         if self.mixdown not in ("mono", "dual"):
             raise ValueError(
@@ -508,14 +514,19 @@ class TranscriptionConfig:
             if available is None:
                 continue
             if not available:
-                fallback = "cpu" if value == "cuda" else "cpu"
+                fallback = "cpu"
                 log.warning(
                     "%s='%s' is not available, falling back to '%s'",
                     field_name, value, fallback,
                 )
                 if field_name == "device":
                     self.device = fallback
+                    self._device_auto_fallback = True
                     if self.compute_type == "float16":
+                        log.warning(
+                            "compute_type='float16' is unsupported on CPU, "
+                            "downgrading to 'int8'"
+                        )
                         self.compute_type = "int8"
                 elif field_name == "torch_device":
                     self.torch_device = fallback
@@ -832,14 +843,10 @@ def _load_whisperx_asr_model(config: TranscriptionConfig, language: str | None):
     }
     device_note = ""
     if config.device == "cpu":
-        try:
-            import torch as _torch
-            if _torch.cuda.is_available():
-                device_note = " (forced)"
-            else:
-                device_note = " (fallback — no GPU)"
-        except ImportError:
-            device_note = " (no torch)"
+        if config._device_auto_fallback:
+            device_note = " (fallback — no GPU)"
+        else:
+            device_note = " (forced)"
     print(
         f"  Loading model: {config.model} ({config.compute_type}) on {config.device}{device_note}"
     )

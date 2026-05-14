@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.7.1 — 2026-05-14
+
+### Fixes
+
+- **Transcription auto-falls back to CPU + `int8` when CUDA is
+  unavailable** (#19, thanks @fadenb) — running `meet run` on a machine
+  without a GPU (laptop, container without passthrough, CI runner)
+  previously crashed with `ValueError: device='cuda' but CUDA is not
+  available`. `TranscriptionConfig` now warns and falls back to
+  `device=cpu`, downgrading `compute_type=float16` to `int8` (float16
+  is unsupported on CPU). The model-load log line annotates whether
+  CPU was forced (`--device cpu`) or auto-selected because no GPU was
+  found, so the diagnostic distinction is preserved.
+
+### Internals
+
+- `TranscriptionConfig` gains an internal `_device_auto_fallback`
+  flag set in `__post_init__` when the device is auto-flipped, so
+  `_load_whisperx_asr_model` can label the load line accurately
+  without re-sniffing torch at print time.
+
 ## v0.7.0 — 2026-05-08
 
 ### Features
