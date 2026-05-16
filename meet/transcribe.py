@@ -1108,10 +1108,29 @@ def transcribe(
 
     Returns:
         Transcript object with diarized segments.
+
+    # ── PATCH jeremycarre38 ──────────────────────────────────────────────────
+    # Les étapes 1 (transcription WhisperX), 2 (alignement wav2vec2) et
+    # 3 (diarisation Pyannote locale) sont remplacées par un unique appel HTTP
+    # vers le serveur distant (PC perso Windows, GPU AMD RX 9070 XT).
+    #
+    # Pourquoi : WhisperX/ctranslate2 n'a pas de support ROCm sous Windows.
+    # Le serveur distant fait tourner openai-whisper (GPU) + pyannote (CPU)
+    # et renvoie les segments avec labels SPEAKER_XX.
+    #
+    # Ce qui est conservé intégralement :
+    # - Capture dual-channel PipeWire (micro/système)
+    # - Mixdown mono avant envoi à l'API
+    # - Logique YOU/REMOTE par énergie RMS canal (étape 5)
+    # - Voiceprint, PDF, résumés, etc.
+    #
+    # Configuration : variable d'environnement WHISPER_API_URL
+    # Exemple : export WHISPER_API_URL=http://192.168.1.8:8000
+    # ────────────────────────────────────────────────────────────────────────
     """
-    import torch
-    import whisperx
-    from whisperx.diarize import DiarizationPipeline
+    # PATCH jeremycarre38 — import requests pour l'appel API distant
+    import os
+    import requests
 
     if config is None:
         config = TranscriptionConfig()
@@ -1122,8 +1141,8 @@ def transcribe(
 
     duration = get_audio_duration(audio_path)
 
-    # If dual-channel, mixdown to mono for the main transcription pipeline
-    # but keep the stereo file for channel-aware diarization hints
+    # Dual-channel : on garde la logique de mixdown mono pour l'envoi à l'API
+    # mais on conserve le fichier stéréo original pour le YOU/REMOTE (étape 5)
     is_stereo = _is_stereo(audio_path)
 
     if not is_stereo and config.mixdown == "dual":
@@ -1131,9 +1150,10 @@ def transcribe(
             "  Warning: --mixdown dual requires stereo audio, using standard mono pipeline"
         )
 
+    # PATCH jeremycarre38 — le mode dual séparé (transcription par canal)
+    # n'est pas supporté par l'API distante. On bascule sur le pipeline mono.
     if is_stereo and config.use_dual_channel and config.mixdown == "dual":
-        print("  Dual-channel detected: transcribing channels separately")
-        return _transcribe_dual_channel(audio_path, config, duration)
+        print("  Dual-channel detected: mixing down to mono for remote API (dual mode unsupported)")
 
     if is_stereo and config.use_dual_channel:
         mono_path = _mixdown_to_mono(audio_path)
@@ -1142,96 +1162,51 @@ def transcribe(
         mono_path = audio_path
 
     try:
-        # ── Step 1: Transcribe with the selected ASR backend ──
-        # "auto" means let WhisperX detect the language from the audio.
+        # ── PATCH jeremycarre38 — Steps 1+2+3 remplacés par appel API ───────
+        # L'original faisait :
+        #   Step 1 : whisperx.load_model() + model.transcribe()
+        #   Step 2 : whisperx.load_align_model() + whisperx.align()
+        #   Step 3 : DiarizationPipeline() + whisperx.assign_word_speakers()
+        #
+        # On remplace tout ça par un POST multipart vers le serveur distant.
+        # Le serveur renvoie {"segments": [...], "language": "fr", ...}
+        # avec chaque segment contenant {start, end, speaker, text}.
+        # ─────────────────────────────────────────────────────────────────────
+
+        api_url = os.environ.get("WHISPER_API_URL", "http://192.168.1.8:8000")
+        transcribe_url = f"{api_url}/transcribe"
+
         whisper_lang = None if config.language == "auto" else config.language
-        audio = whisperx.load_audio(str(mono_path))
 
-        # Pad audio with silence at the end so the VAD properly closes the
-        # final speech segment instead of cutting it off abruptly.
-        if config.audio_pad_seconds > 0:
-            import numpy as np
-
-            pad_samples = int(config.audio_pad_seconds * 16000)
-            audio = np.concatenate([audio, np.zeros(pad_samples, dtype=audio.dtype)])
-
-        result = _transcribe_asr(audio, config, whisper_lang)
-
-        # Resolve the actual language (important when auto-detecting).
-        detected_language = result.get("language", whisper_lang or "en")
-        if config.language == "auto":
-            print(f"  Detected language: {detected_language}")
-
-        # Free transcription model memory
-        gc.collect()
-        _empty_torch_caches(torch, config)
-
-        # ── Step 2: Align for word-level timestamps ──
-        if config.skip_alignment:
-            print("  Skipping alignment (--skip-alignment)")
-        elif detected_language in ALIGNMENT_MODELS and not check_alignment_model_cached(
-            detected_language
-        ):
-            # Model is in our registry but not downloaded — raise so
-            # the caller (CLI/GUI) can show an actionable error.
-            # Free VRAM first so the error handler can download if needed.
-            gc.collect()
-            _empty_torch_cache(torch, config.torch_device)
-            raise AlignmentModelMissing(detected_language)
-        else:
-            print(f"  Aligning word timestamps ({detected_language})...")
-            try:
-                model_a, metadata = whisperx.load_align_model(
-                    language_code=detected_language,
-                    device=config.torch_device,
-                )
-                result = whisperx.align(
-                    result["segments"],
-                    model_a,
-                    metadata,
-                    audio,
-                    config.torch_device,
-                    return_char_alignments=False,
-                )
-
-                del model_a
-                gc.collect()
-                _empty_torch_cache(torch, config.torch_device)
-            except Exception as align_exc:
-                # For languages NOT in our registry (WhisperX supports ~39),
-                # we can't pre-check the cache.  If the download fails at
-                # runtime, fall back gracefully since there's no actionable
-                # fix we can offer.
-                if detected_language in ALIGNMENT_MODELS:
-                    # This shouldn't happen (we checked cache above), but
-                    # if it does, re-raise as AlignmentModelMissing.
-                    raise AlignmentModelMissing(detected_language) from align_exc
-                print(
-                    f"  Warning: alignment failed ({align_exc}), continuing without word-level timestamps"
-                )
-
-        # ── Step 3: Speaker diarization ──
-        if config.hf_token:
-            print("  Running speaker diarization...")
-            diarize_model = DiarizationPipeline(
-                token=config.hf_token,
-                device=config.torch_device,
+        print(f"  Sending audio to remote API: {transcribe_url}")
+        with open(str(mono_path), "rb") as audio_f:
+            response = requests.post(
+                transcribe_url,
+                files={"audio": (mono_path.name, audio_f, "audio/wav")},
+                data={"prompt": ""},
+                timeout=600,  # 10 minutes max pour les longues réunions
             )
+        response.raise_for_status()
+        api_result = response.json()
 
-            diarize_kwargs: dict[str, Any] = {}
-            if config.min_speakers is not None:
-                diarize_kwargs["min_speakers"] = config.min_speakers
-            if config.max_speakers is not None:
-                diarize_kwargs["max_speakers"] = config.max_speakers
+        detected_language = api_result.get("language", whisper_lang or "fr")
+        print(f"  Remote API response: {len(api_result['segments'])} segments, lang={detected_language}")
 
-            diarize_segments = diarize_model(audio, **diarize_kwargs)
-            result = whisperx.assign_word_speakers(diarize_segments, result)
-
-            del diarize_model
-            gc.collect()
-            _empty_torch_cache(torch, config.torch_device)
-        else:
-            print("  Skipping diarization (no HF_TOKEN provided)")
+        # Convertir le format API vers le format attendu par la suite du pipeline
+        result = {
+            "segments": [
+                {
+                    "start": s["start"],
+                    "end": s["end"],
+                    "text": s["text"],
+                    "speaker": s.get("speaker"),
+                    "words": [],  # pas de word-level timestamps (pas d'alignement wav2vec2)
+                }
+                for s in api_result["segments"]
+            ],
+            "language": detected_language,
+        }
+        # ── Fin PATCH jeremycarre38 Steps 1+2+3 ──────────────────────────────
 
         # ── Step 4: Build Transcript object ──
         # Clamp segment timestamps to actual audio duration (we may have
@@ -1261,6 +1236,9 @@ def transcribe(
         speakers = [Speaker(id=sid) for sid in sorted(speaker_ids)]
 
         # ── Step 5: Dual-channel speaker labeling ──
+        # PATCH jeremycarre38 — cette étape est conservée intégralement.
+        # Elle mappe les SPEAKER_XX renvoyés par l'API vers YOU/REMOTE
+        # en comparant l'énergie RMS sur chaque canal du fichier stéréo original.
         if is_stereo and config.use_dual_channel:
             if len(speakers) >= 2:
                 # Pyannote found multiple speakers — map them to YOU/REMOTE
