@@ -1184,7 +1184,7 @@ def transcribe(
                 transcribe_url,
                 files={"audio": (mono_path.name, audio_f, "audio/wav")},
                 data={"prompt": ""},
-                timeout=600,  # 10 minutes max pour les longues réunions
+                timeout=None,  # 10 minutes max pour les longues réunions
             )
         response.raise_for_status()
         api_result = response.json()
