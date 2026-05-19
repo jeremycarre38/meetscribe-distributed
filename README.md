@@ -127,6 +127,17 @@ sudo dnf install ffmpeg pulseaudio-utils
 # From PyPI (recommended)
 pip install meetscribe-offline
 
+pip install sounddevice soundfile
+
+Verifier avec:
+from meet.capture import list_sources, get_default_source, get_default_sink
+for d in list_sources():
+    if d['max_input_channels'] > 0:
+        print(d['name'])
+print("MIC :", get_default_source())
+print("MONITOR :", get_default_sink())
+
+
 # From source
 git clone https://github.com/pretyflaco/meetscribe
 cd meetscribe
