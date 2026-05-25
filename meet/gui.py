@@ -687,6 +687,7 @@ class MeetRecorderWindow(Gtk.Window):
                 transcript.segments,
                 confirmed_label_map,
                 self._label_channel_map,
+                speaker_embeddings=transcript.speaker_embeddings,
             )
         except Exception as exc:
             _log.warning("Voice profile update failed: %s", exc)
@@ -1202,6 +1203,7 @@ class MeetRecorderWindow(Gtk.Window):
                             transcript.segments,
                             transcript.speakers,
                             channel_map,
+                            speaker_embeddings=transcript.speaker_embeddings,
                         )
                     except Exception as exc:
                         _log.warning("Voice identification failed: %s", exc)

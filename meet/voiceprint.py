@@ -299,6 +299,11 @@ def enroll_session(
 ) -> dict[str, bool]:
     """Enroll all labeled speakers from a session into the profile database.
 
+    Lit en priorité les embeddings persistés dans le transcript JSON (calculés
+    par le serveur au moment de la transcription). Si absents (sessions
+    antérieures au switch vers le serveur), fallback sur l'extraction locale
+    via pyannote.
+
     Args:
         session_dir: Path to a labeled session directory (must have
                      session.json with speaker_labels and a transcript JSON).
@@ -308,8 +313,6 @@ def enroll_session(
         Dict mapping speaker name to True (enrolled) or False (failed).
     """
     from meet.label import _find_session_files, _load_transcript
-    from meet.audio import read_stereo_channels
-    from meet.transcribe import Segment
 
     def _log(msg: str) -> None:
         if progress_callback:
@@ -337,37 +340,44 @@ def enroll_session(
 
     transcript = _load_transcript(transcript_json)
 
-    # Build a reverse map: relabeled_name -> original speaker_id
-    # The transcript has already been relabeled, so segments use real names.
-    # speaker_labels maps REMOTE_N -> Name, so we need to find segments by name.
-    # Build a channel map: name -> channel based on whether it was YOU or REMOTE
-    channel_map: dict[str, str] = {}
-    for speaker_id, name in speaker_labels.items():
-        if speaker_id == "YOU":
-            channel_map[name] = "mic"
-        else:
-            channel_map[name] = "system"
+    # Les segments du transcript portent déjà les vrais noms (post-relabel).
+    # speaker_embeddings (si présent) est aussi keyed par nom final.
+    names_in_session = set(speaker_labels.values())
 
-    # Transcript segments already have real names as speaker IDs (post-relabel)
-    # Build a pseudo speaker_labels where key == value (name -> name)
-    name_to_name = {name: name for name in speaker_labels.values()}
+    embeddings: dict[str, np.ndarray] = {}
 
-    # Find audio file
-    audio_path = files.get("wav")
-    if not audio_path or not audio_path.exists():
-        raise FileNotFoundError(f"No audio file found in {session_dir}")
+    if transcript.speaker_embeddings:
+        _log("  Using embeddings persisted from server transcription...")
+        for name in names_in_session:
+            vec = transcript.speaker_embeddings.get(name)
+            if vec:
+                arr = np.array(vec, dtype=np.float32)
+                if arr.size > 0:
+                    embeddings[name] = arr
+    else:
+        # Fallback legacy : recalcul local via pyannote
+        _log("  No server-side embeddings — falling back to local extraction")
+        audio_path = files.get("wav")
+        if not audio_path or not audio_path.exists():
+            raise FileNotFoundError(f"No audio file found in {session_dir}")
 
-    _log(f"  Extracting embeddings from {audio_path.name}...")
+        # Build a channel map: name -> channel
+        channel_map: dict[str, str] = {}
+        for speaker_id, name in speaker_labels.items():
+            channel_map[name] = "mic" if speaker_id == "YOU" else "system"
 
-    embeddings = extract_speaker_embeddings(
-        audio_path,
-        transcript.segments,
-        name_to_name,
-        channel_map,
-    )
+        name_to_name = {name: name for name in names_in_session}
+
+        _log(f"  Extracting embeddings from {audio_path.name}...")
+        embeddings = extract_speaker_embeddings(
+            audio_path,
+            transcript.segments,
+            name_to_name,
+            channel_map,
+        )
 
     if not embeddings:
-        _log("  No embeddings extracted — check audio file and transcript.")
+        _log("  No embeddings extracted — check transcript.")
         return {}
 
     # Merge into profiles
@@ -403,17 +413,24 @@ def identify_speakers(
     transcript_segments: list,
     speakers: list,              # list of Speaker objects (have .id attribute)
     channel_map: dict[str, str], # speaker_id -> 'mic' | 'system'
+    speaker_embeddings: dict[str, list[float]] | None = None,
 ) -> dict[str, SpeakerMatch]:
     """Identify speakers in a new meeting against the profile database.
 
-    Uses cosine similarity with greedy 1:1 matching (best match first).
-    Only returns matches above MATCH_THRESHOLD.
+    Compares each speaker's embedding to every profile and assigns the best
+    match above MATCH_THRESHOLD. Several speakers in the same meeting may map
+    to the same profile (Fix 1 — résout le cas où pyannote splitte un même
+    locuteur en SPEAKER_00 + SPEAKER_02). Le caller doit alors fusionner.
 
     Args:
-        audio_path: Path to the session audio (OGG or WAV).
+        audio_path: Path to the session audio (used only for legacy fallback).
         transcript_segments: Segment objects from the new transcript.
         speakers: Speaker objects — their .id fields are used.
-        channel_map: Map from speaker_id to dominant channel.
+        channel_map: Map from speaker_id to dominant channel (legacy fallback).
+        speaker_embeddings: Embeddings 256-dim par speaker_id, calculés côté
+            serveur et renvoyés par l'API /transcribe. Si fourni, on n'a pas
+            besoin de charger pyannote en local. Sinon (anciennes sessions),
+            fallback sur l'extraction locale.
 
     Returns:
         Dict mapping speaker_id to (matched_name, confidence).
@@ -423,72 +440,72 @@ def identify_speakers(
     if not profiles:
         return {}
 
-    # Build speaker_labels dict: all speaker IDs map to themselves
-    # (we pass them through extract_speaker_embeddings)
-    all_ids = {sp.id: sp.id for sp in speakers}
-
-    try:
-        inference = _get_inference()
-    except Exception as exc:
-        log.warning("Could not load embedding model: %s", exc)
-        return {}
-
-    # Extract embeddings for each speaker in the new transcript
+    # --- Construction des embeddings du transcript ---
     new_embeddings: dict[str, np.ndarray] = {}
-    for speaker_id in all_ids:
-        segs = [
-            (seg.start, seg.end)
-            for seg in transcript_segments
-            if seg.speaker == speaker_id and (seg.end - seg.start) >= MIN_SEGMENT_DURATION
-        ]
-        if not segs:
-            continue
-        segs.sort(key=lambda s: s[1] - s[0], reverse=True)
-        selected = segs[:MAX_SEGMENTS_PER_SPEAKER]
 
-        channel = channel_map.get(speaker_id, "system")
-        channel_data = _extract_channel_audio(audio_path, channel)
-        if channel_data is None:
-            continue
+    if speaker_embeddings:
+        # Voie rapide : embeddings fournis par le serveur, aucun calcul local.
+        for sp in speakers:
+            vec = speaker_embeddings.get(sp.id)
+            if vec:
+                arr = np.array(vec, dtype=np.float32)
+                if arr.size > 0:
+                    new_embeddings[sp.id] = arr
+    else:
+        # Fallback legacy : recalcul local via pyannote (anciennes sessions
+        # transcrites avant l'ajout des embeddings côté serveur).
+        log.info("No server-side embeddings — falling back to local extraction")
+        try:
+            inference = _get_inference()
+        except Exception as exc:
+            log.warning("Could not load embedding model: %s", exc)
+            return {}
 
-        samples, sr = channel_data
-        emb = _embed_segments(samples, sr, selected, inference)
-        if emb is not None:
-            new_embeddings[speaker_id] = emb
+        for sp in speakers:
+            speaker_id = sp.id
+            segs = [
+                (seg.start, seg.end)
+                for seg in transcript_segments
+                if seg.speaker == speaker_id and (seg.end - seg.start) >= MIN_SEGMENT_DURATION
+            ]
+            if not segs:
+                continue
+            segs.sort(key=lambda s: s[1] - s[0], reverse=True)
+            selected = segs[:MAX_SEGMENTS_PER_SPEAKER]
+
+            channel = channel_map.get(speaker_id, "system")
+            channel_data = _extract_channel_audio(audio_path, channel)
+            if channel_data is None:
+                continue
+
+            samples, sr = channel_data
+            emb = _embed_segments(samples, sr, selected, inference)
+            if emb is not None:
+                new_embeddings[speaker_id] = emb
 
     if not new_embeddings:
         return {}
 
-    # Compute cosine similarity matrix (new speakers × profiles)
+    # --- Matching cosine similarity (Fix 1 : pas de contrainte 1:1) ---
     profile_names = list(profiles.keys())
     profile_matrix = np.stack([profiles[n].embedding for n in profile_names])  # (P, 256)
 
     speaker_ids = list(new_embeddings.keys())
     new_matrix = np.stack([new_embeddings[sid] for sid in speaker_ids])  # (S, 256)
 
-    # Cosine similarity: since both are L2-normalized, dot product = cosine similarity
+    # Cosine similarity : les deux sont L2-normalisés → produit scalaire suffit
     sim_matrix = new_matrix @ profile_matrix.T  # (S, P)
 
-    # Greedy 1:1 matching: assign best available match above threshold
+    # Pour chaque speaker, prendre son meilleur profil (s'il est au-dessus du seuil).
+    # Plusieurs speakers peuvent matcher le même profil → le caller fusionnera.
     matches: dict[str, SpeakerMatch] = {}
-    used_profiles: set[int] = set()
-
-    # Iterate over (speaker_idx, profile_idx) pairs sorted by similarity desc
-    indices = np.argsort(-sim_matrix, axis=None)  # flat indices, sorted desc
-    for flat_idx in indices:
-        s_idx, p_idx = np.unravel_index(flat_idx, sim_matrix.shape)
+    for s_idx, speaker_id in enumerate(speaker_ids):
+        p_idx = int(np.argmax(sim_matrix[s_idx]))
         score = float(sim_matrix[s_idx, p_idx])
-        if score < MATCH_THRESHOLD:
-            break
-
-        speaker_id = speaker_ids[s_idx]
-        profile_name = profile_names[p_idx]
-
-        if speaker_id in matches or p_idx in used_profiles:
-            continue
-
-        matches[speaker_id] = SpeakerMatch(name=profile_name, confidence=score)
-        used_profiles.add(p_idx)
+        if score >= MATCH_THRESHOLD:
+            matches[speaker_id] = SpeakerMatch(
+                name=profile_names[p_idx], confidence=score
+            )
 
     return matches
 
@@ -498,6 +515,7 @@ def update_profiles_from_confirmed_labels(
     transcript_segments: list,
     confirmed_label_map: dict[str, str],  # speaker_id -> confirmed name
     channel_map: dict[str, str],
+    speaker_embeddings: dict[str, list[float]] | None = None,
 ) -> None:
     """Update profiles with confirmed labels from a just-completed meeting.
 
@@ -505,45 +523,66 @@ def update_profiles_from_confirmed_labels(
     the database improves over time without explicit `meet enroll` runs.
 
     Args:
-        audio_path: Session audio file.
+        audio_path: Session audio file (used only for legacy fallback).
         transcript_segments: Segments from the transcript.
         confirmed_label_map: Map from speaker_id to confirmed human name.
-        channel_map: Map from speaker_id to 'mic' | 'system'.
+        channel_map: Map from speaker_id to 'mic' | 'system' (legacy fallback).
+        speaker_embeddings: Embeddings 256-dim renvoyés par le serveur. Si
+            fourni, aucun appel pyannote local. Sinon, fallback legacy.
     """
     if not confirmed_label_map:
         return
 
-    try:
-        inference = _get_inference()
-    except Exception as exc:
-        log.warning("Could not load embedding model for profile update: %s", exc)
+    # --- Récupère un embedding par speaker_id confirmé ---
+    embeddings: dict[str, np.ndarray] = {}
+
+    if speaker_embeddings:
+        for speaker_id in confirmed_label_map:
+            vec = speaker_embeddings.get(speaker_id)
+            if vec:
+                arr = np.array(vec, dtype=np.float32)
+                if arr.size > 0:
+                    embeddings[speaker_id] = arr
+    else:
+        # Fallback legacy : recalcul local via pyannote.
+        log.info("No server-side embeddings — falling back to local extraction")
+        try:
+            inference = _get_inference()
+        except Exception as exc:
+            log.warning("Could not load embedding model for profile update: %s", exc)
+            return
+
+        for speaker_id in confirmed_label_map:
+            segs = [
+                (seg.start, seg.end)
+                for seg in transcript_segments
+                if seg.speaker == speaker_id and (seg.end - seg.start) >= MIN_SEGMENT_DURATION
+            ]
+            if not segs:
+                continue
+            segs.sort(key=lambda s: s[1] - s[0], reverse=True)
+            selected = segs[:MAX_SEGMENTS_PER_SPEAKER]
+
+            channel = channel_map.get(speaker_id, "system")
+            channel_data = _extract_channel_audio(audio_path, channel)
+            if channel_data is None:
+                continue
+
+            samples, sr = channel_data
+            emb = _embed_segments(samples, sr, selected, inference)
+            if emb is not None:
+                embeddings[speaker_id] = emb
+
+    if not embeddings:
         return
 
     profiles = load_profiles()
     updated = []
 
     for speaker_id, name in confirmed_label_map.items():
-        segs = [
-            (seg.start, seg.end)
-            for seg in transcript_segments
-            if seg.speaker == speaker_id and (seg.end - seg.start) >= MIN_SEGMENT_DURATION
-        ]
-        if not segs:
-            continue
-
-        segs.sort(key=lambda s: s[1] - s[0], reverse=True)
-        selected = segs[:MAX_SEGMENTS_PER_SPEAKER]
-
-        channel = channel_map.get(speaker_id, "system")
-        channel_data = _extract_channel_audio(audio_path, channel)
-        if channel_data is None:
-            continue
-
-        samples, sr = channel_data
-        emb = _embed_segments(samples, sr, selected, inference)
+        emb = embeddings.get(speaker_id)
         if emb is None:
             continue
-
         if name in profiles:
             profiles[name] = _merge_embedding(profiles[name], emb)
         else:

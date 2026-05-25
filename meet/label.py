@@ -109,6 +109,7 @@ def _load_transcript(json_path: Path) -> Transcript:
         language=data.get("language", "en"),
         audio_file=data.get("audio_file", ""),
         duration=data.get("duration"),
+        speaker_embeddings=data.get("speaker_embeddings"),
     )
 
 
@@ -487,6 +488,10 @@ def relabel_transcript_in_memory(
 
     This is used by the GUI to relabel in-memory before the first save,
     avoiding the need to regenerate outputs.
+
+    Quand plusieurs anciens IDs mappent vers le même nom (Fix 1 — fusion de
+    speakers splittés par pyannote), on dédoublonne la liste des speakers et
+    on moyenne les embeddings.
     """
     if not label_map:
         return transcript
@@ -502,10 +507,34 @@ def relabel_transcript_in_memory(
             words=seg.words,
         ))
 
+    # Dédoublonne les speakers après mapping
     new_speakers = []
+    seen_ids: set[str] = set()
     for sp in transcript.speakers:
         new_id = label_map.get(sp.id, sp.id)
+        if new_id in seen_ids:
+            continue
+        seen_ids.add(new_id)
         new_speakers.append(Speaker(id=new_id, label=new_id))
+
+    # Remappe les embeddings : si N speakers → même nom, on moyenne
+    new_embeddings: dict[str, list[float]] | None = None
+    if transcript.speaker_embeddings:
+        import numpy as np
+        grouped: dict[str, list[list[float]]] = {}
+        for old_id, vec in transcript.speaker_embeddings.items():
+            new_id = label_map.get(old_id, old_id)
+            grouped.setdefault(new_id, []).append(vec)
+        new_embeddings = {}
+        for new_id, vecs in grouped.items():
+            if len(vecs) == 1:
+                new_embeddings[new_id] = vecs[0]
+            else:
+                arr = np.mean(np.array(vecs, dtype=np.float32), axis=0)
+                norm = float(np.linalg.norm(arr))
+                if norm > 0:
+                    arr = arr / norm
+                new_embeddings[new_id] = arr.tolist()
 
     return Transcript(
         segments=new_segments,
@@ -513,4 +542,5 @@ def relabel_transcript_in_memory(
         language=transcript.language,
         audio_file=transcript.audio_file,
         duration=transcript.duration,
+        speaker_embeddings=new_embeddings,
     )

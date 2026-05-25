@@ -1036,6 +1036,7 @@ def label(session_dir, no_audio, no_summary, auto, summary_backend, summary_mode
                     transcript.segments,
                     transcript.speakers,
                     channel_map,
+                    speaker_embeddings=transcript.speaker_embeddings,
                 )
                 if auto_matches:
                     click.echo(
@@ -1193,6 +1194,7 @@ def label(session_dir, no_audio, no_summary, auto, summary_backend, summary_mode
                 transcript.segments,
                 label_map,
                 channel_map,
+                speaker_embeddings=transcript.speaker_embeddings,
             )
             click.echo("  Voice profiles updated.")
         except Exception as exc:

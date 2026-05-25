@@ -568,6 +568,10 @@ class Transcript:
     language: str
     audio_file: str
     duration: float | None = None
+    # Embeddings 256-dim par speaker, renvoyés par le serveur de transcription.
+    # Utilisés par le voiceprint (identification cross-sessions sans recalcul local).
+    # Clés = labels de speaker FINAUX (après relabeling YOU/REMOTE éventuel).
+    speaker_embeddings: dict[str, list[float]] | None = None
 
     def to_text(self) -> str:
         """Plain text output with speaker labels."""
@@ -599,6 +603,7 @@ class Transcript:
             "language": self.language,
             "duration": self.duration,
             "speakers": [{"id": s.id, "label": s.label} for s in self.speakers],
+            "speaker_embeddings": self.speaker_embeddings,
             "segments": [
                 {
                     "start": seg.start,
@@ -1192,6 +1197,13 @@ def transcribe(
         detected_language = api_result.get("language", whisper_lang or "fr")
         print(f"  Remote API response: {len(api_result['segments'])} segments, lang={detected_language}")
 
+        # Embeddings 256-dim par speaker (pour voiceprint, calculés côté serveur)
+        api_speaker_embeddings: dict[str, list[float]] = api_result.get(
+            "speakers_embeddings", {}
+        ) or {}
+        if api_speaker_embeddings:
+            print(f"  Received embeddings for {len(api_speaker_embeddings)} speaker(s)")
+
         # Convertir le format API vers le format attendu par la suite du pipeline
         result = {
             "segments": [
@@ -1239,6 +1251,9 @@ def transcribe(
         # PATCH jeremycarre38 — cette étape est conservée intégralement.
         # Elle mappe les SPEAKER_XX renvoyés par l'API vers YOU/REMOTE
         # en comparant l'énergie RMS sur chaque canal du fichier stéréo original.
+        # Snapshot des speakers AVANT relabeling pour pouvoir remapper les embeddings.
+        pre_label_speakers = [seg.speaker for seg in segments]
+
         if is_stereo and config.use_dual_channel:
             if len(speakers) >= 2:
                 # Pyannote found multiple speakers — map them to YOU/REMOTE
@@ -1258,12 +1273,40 @@ def transcribe(
                 )
                 segments, speakers = _split_by_channel(audio_path, segments)
 
+        # Remapper les embeddings vers les labels finaux (YOU/REMOTE/REMOTE_1...)
+        # en reconstruisant le label_map à partir du segment-by-segment delta.
+        final_embeddings: dict[str, list[float]] | None = None
+        if api_speaker_embeddings:
+            import numpy as np
+
+            api_to_final: dict[str, str] = {}
+            for old_spk, new_seg in zip(pre_label_speakers, segments):
+                if old_spk and new_seg.speaker:
+                    api_to_final[old_spk] = new_seg.speaker
+            # Si plusieurs speakers API mappent vers le même label final
+            # (split réuni en un seul YOU/REMOTE), on moyenne les vecteurs.
+            grouped: dict[str, list[list[float]]] = {}
+            for api_spk, vec in api_speaker_embeddings.items():
+                final_spk = api_to_final.get(api_spk, api_spk)
+                grouped.setdefault(final_spk, []).append(vec)
+            final_embeddings = {}
+            for final_spk, vecs in grouped.items():
+                if len(vecs) == 1:
+                    final_embeddings[final_spk] = vecs[0]
+                else:
+                    arr = np.mean(np.array(vecs, dtype=np.float32), axis=0)
+                    norm = float(np.linalg.norm(arr))
+                    if norm > 0:
+                        arr = arr / norm
+                    final_embeddings[final_spk] = arr.tolist()
+
         return Transcript(
             segments=segments,
             speakers=speakers,
             language=detected_language,
             audio_file=str(audio_path),
             duration=duration,
+            speaker_embeddings=final_embeddings,
         )
 
     finally:
