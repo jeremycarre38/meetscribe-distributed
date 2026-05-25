@@ -1783,5 +1783,39 @@ def ingest(
         raise SystemExit(1)
 
 
+@main.command()
+@click.argument("session_dir", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--offset-ms",
+    type=int,
+    required=True,
+    help="New monitor-vs-mic delay in milliseconds. Positive = monitor "
+    "(music/system) is delayed relative to mic (voice). Increase if voice "
+    "sounds late on music; decrease if voice sounds early.",
+)
+def remix(session_dir, offset_ms):
+    """Re-merge a session's .mic.wav and .sys.wav with a custom offset.
+
+    Use to tune sync after a recording without re-capturing. The session
+    directory must still contain the .mic.wav and .sys.wav intermediates
+    that capture.py leaves in place.
+
+    \b
+    Example:
+        meet remix ~/meetscribe-recordings/meeting-20260519-145021 --offset-ms 4500
+    """
+    from meet.capture import remix_session
+
+    try:
+        out = remix_session(session_dir, offset_ms)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+    except RuntimeError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+    click.echo(f"Remixed → {out} (offset_ms={offset_ms})")
+
+
 if __name__ == "__main__":
     main()

@@ -36,8 +36,13 @@ CPU-only mode works (`--device cpu`) but is significantly slower.
 |---------|---------|---------|
 | Python 3.10+ | Runtime | `sudo apt install python3` |
 | ffmpeg 4.4+ | Audio capture & format conversion | `sudo apt install ffmpeg` |
+| PortAudio | Required by `sounddevice` for in-process capture | `sudo apt install libportaudio2` (add `portaudio19-dev` if you need to rebuild `sounddevice`/`pyaudio` from source) |
 | PulseAudio tools | Audio device enumeration | `sudo apt install pulseaudio-utils` (usually pre-installed) |
 | GTK3 | GUI widget (optional) | `sudo apt install gir1.2-gtk-3.0` (usually pre-installed) |
+
+> Symptom if PortAudio is missing: every `meet` plugin prints
+> `warning: failed to load 'meet' plugin '<name>': PortAudio library not found`
+> and only `record`/`check`/`devices`/`archive` remain available.
 
 ### Python packages
 

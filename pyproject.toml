@@ -59,6 +59,7 @@ enroll = "meet.cli:enroll"
 sync = "meet.cli:sync"
 gui = "meet.cli:gui"
 ingest = "meet.cli:ingest"
+remix = "meet.cli:remix"
 
 [project.urls]
 Homepage = "https://github.com/pretyflaco/meetscribe"
